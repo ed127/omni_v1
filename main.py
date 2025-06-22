@@ -27,7 +27,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CONFIDENCE_THRESHOLD = 90
+CONFIDENCE_THRESHOLD = 99
 LIMIT = 500
 
 application = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -91,15 +91,9 @@ def train_model(df):
     X_scaled = scaler.fit_transform(X)
     model = XGBClassifier(use_label_encoder=False, eval_metric='logloss')
     model.fit(X_scaled, y)
-    return model, scaler, features
+    return model, scaler, features, (X_scaled, y)
 
-def backtest_model(model, scaler, features, df):
-    df = compute_indicators(df)
-    df = create_targets(df)
-    df.dropna(inplace=True)
-    X = df[features]
-    y_true = df['target']
-    X_scaled = scaler.transform(X)
+def backtest_model(model, X_scaled, y_true):
     y_pred = model.predict(X_scaled)
     accuracy = (y_true == y_pred).mean()
     logging.info(f"Backtest Accuracy: {accuracy:.2%}")
@@ -137,30 +131,6 @@ def generate_futures_signal(model, scaler, features, df, sentiment, profit_thres
 
     return signal, confidence, current_price, entry, sl, tp
 
-def check_position_closed(symbol, current_price):
-    if symbol not in open_positions:
-        return False
-
-    pos = open_positions[symbol]
-    sl_hit = tp_hit = False
-
-    if pos['signal'] == 'long':
-        if current_price <= pos['sl']:
-            sl_hit = True
-        elif current_price >= pos['tp']:
-            tp_hit = True
-    elif pos['signal'] == 'short':
-        if current_price >= pos['sl']:
-            sl_hit = True
-        elif current_price <= pos['tp']:
-            tp_hit = True
-
-    if sl_hit or tp_hit:
-        reason = "TP" if tp_hit else "SL"
-        del open_positions[symbol]
-        return reason
-    return False
-
 def place_futures_order(symbol, side, price, sl, tp):
     try:
         order = client_private.place_order_v3(
@@ -194,59 +164,80 @@ async def run():
     sentiment = fetch_fear_greed_index()
     logging.info(f"Fear & Greed Index: {sentiment}")
 
+    best_trade = None
+    summary = []
+
     for symbol in symbols:
         try:
             df = fetch_klines(symbol)
-            model, scaler, features = train_model(df)
-            backtest_model(model, scaler, features, df)
+            model, scaler, features, (X_scaled, y_true) = train_model(df)
+            accuracy = backtest_model(model, X_scaled, y_true)
             signal, confidence, price, entry, sl, tp = generate_futures_signal(model, scaler, features, df, sentiment)
 
-            closed_reason = check_position_closed(symbol, price)
-            if closed_reason:
-                await send_alert(f"✅ {symbol} position closed by {closed_reason}\nPrice: {price}")
-                logging.info(f"{symbol} position closed by {closed_reason}")
+            summary.append(f"{symbol}: {confidence}% - {signal.upper()} - Acc: {accuracy:.2%}")
 
-            position = open_positions.get(symbol)
-
-            if signal != 'hold':
-                if position is None:
-                    order_id = place_futures_order(symbol, signal, entry, sl, tp)
-                    if order_id:
-                        open_positions[symbol] = {'signal': signal, 'entry': entry, 'sl': sl, 'tp': tp, 'order_id': order_id}
-                        msg = f"\n📈 {symbol} FUTURES SIGNAL ({signal.upper()})\n"
-                        msg += f"Confidence: {confidence}%\nEntry: {entry}\nSL: {sl}\nTP: {tp}\nCurrent Price: {price}\nFear & Greed Index: {sentiment}"
-                        await send_alert(msg)
-                else:
-                    updated = False
-                    if abs(position['tp'] - tp) / position['tp'] > TP_SL_UPDATE_THRESHOLD:
-                        position['tp'] = tp
-                        updated = True
-                    if abs(position['sl'] - sl) / position['sl'] > TP_SL_UPDATE_THRESHOLD:
-                        position['sl'] = sl
-                        updated = True
-
-                    if updated:
-                        try:
-                            if 'order_id' in position:
-                                client_private.cancel_order_v3(symbol=symbol, orderId=position['order_id'])
-                                logging.info(f"Cancelled old order {position['order_id']} for {symbol}")
-                        except Exception as e:
-                            logging.warning(f"Failed to cancel order: {e}")
-
-                        new_order_id = place_futures_order(symbol, position['signal'], entry, sl, tp)
-                        if new_order_id:
-                            position['order_id'] = new_order_id
-
-                        msg = f"\n🔄 {symbol} TP/SL UPDATED\n"
-                        msg += f"Signal: {position['signal'].upper()}\nNew SL: {sl}\nNew TP: {tp}\nCurrent Price: {price}"
-                        await send_alert(msg)
-                    else:
-                        logging.info(f"{symbol}: Position unchanged. No TP/SL update needed.")
-            else:
-                logging.info(f"{symbol}: HOLD - Confidence: {confidence}%")
+            if signal != 'hold' and confidence >= CONFIDENCE_THRESHOLD:
+                if best_trade is None or confidence > best_trade['confidence']:
+                    best_trade = {
+                        'symbol': symbol,
+                        'signal': signal,
+                        'confidence': confidence,
+                        'price': price,
+                        'entry': entry,
+                        'sl': sl,
+                        'tp': tp
+                    }
         except Exception as e:
             logging.error(f"Error for {symbol}: {e}")
 
+    if best_trade:
+        symbol = best_trade['symbol']
+        signal = best_trade['signal']
+        confidence = best_trade['confidence']
+        entry = best_trade['entry']
+        sl = best_trade['sl']
+        tp = best_trade['tp']
+        price = best_trade['price']
+
+        position = open_positions.get(symbol)
+
+        if position is None:
+            order_id = place_futures_order(symbol, signal, entry, sl, tp)
+            if order_id:
+                open_positions[symbol] = {'signal': signal, 'entry': entry, 'sl': sl, 'tp': tp, 'order_id': order_id}
+                msg = f"\n📈 {symbol} FUTURES SIGNAL ({signal.upper()})\n"
+                msg += f"Confidence: {confidence}%\nEntry: {entry}\nSL: {sl}\nTP: {tp}\nCurrent Price: {price}\nFear & Greed Index: {sentiment}"
+                await send_alert(msg)
+        else:
+            updated = False
+            if abs(position['tp'] - tp) / position['tp'] > TP_SL_UPDATE_THRESHOLD:
+                position['tp'] = tp
+                updated = True
+            if abs(position['sl'] - sl) / position['sl'] > TP_SL_UPDATE_THRESHOLD:
+                position['sl'] = sl
+                updated = True
+
+            if updated:
+                try:
+                    if 'order_id' in position:
+                        client_private.cancel_order_v3(symbol=symbol, orderId=position['order_id'])
+                        logging.info(f"Cancelled old order {position['order_id']} for {symbol}")
+                except Exception as e:
+                    logging.warning(f"Failed to cancel order: {e}")
+
+                new_order_id = place_futures_order(symbol, signal, entry, sl, tp)
+                if new_order_id:
+                    position['order_id'] = new_order_id
+
+                msg = f"\n🔄 {symbol} TP/SL UPDATED\n"
+                msg += f"Signal: {signal.upper()}\nNew SL: {sl}\nNew TP: {tp}\nCurrent Price: {price}"
+                await send_alert(msg)
+            else:
+                logging.info(f"{symbol}: Position unchanged. No TP/SL update needed.")
+    else:
+        logging.info("No trade met the 99% confidence threshold.")
+
+    await send_alert("📊 Cycle Summary:\n" + "\n".join(summary))
     await asyncio.sleep(90)
     await run()
 
