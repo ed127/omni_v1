@@ -7,4 +7,5 @@ scikit-learn
 flask
 python-dotenv
 python-telegram-bot==20.7
+web3>=6.0.0
 apexomni
