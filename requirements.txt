@@ -1,0 +1,10 @@
+pandas
+numpy
+requests
+ta
+xgboost
+scikit-learn
+flask
+python-dotenv
+python-telegram-bot==20.7
+apexomni
