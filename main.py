@@ -29,6 +29,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CONFIDENCE_THRESHOLD = 99
 LIMIT = 500
+CYCLE_INTERVAL_SECONDS = int(os.getenv("CYCLE_INTERVAL", 180))
 
 application = Application.builder().token(TELEGRAM_TOKEN).build()
 telegram_bot = application.bot
@@ -154,7 +155,8 @@ def home():
     return "Futures Bot is running"
 
 def run_flask():
-    app.run(host='0.0.0.0', port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
     Thread(target=run_flask).start()
@@ -238,7 +240,7 @@ async def run():
         logging.info("No trade met the 99% confidence threshold.")
 
     await send_alert("📊 Cycle Summary:\n" + "\n".join(summary))
-    await asyncio.sleep(90)
+    await asyncio.sleep(CYCLE_INTERVAL_SECONDS)
     await run()
 
 if __name__ == '__main__':
