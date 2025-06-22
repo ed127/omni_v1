@@ -15,4 +15,4 @@ urllib3
 web3
 xgboost
 python-telegram-bot==20.7
-
+ecdsa
