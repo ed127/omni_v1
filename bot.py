@@ -32,7 +32,7 @@ class EnhancedArbitrageBot:
 
         self.USDT = Web3.to_checksum_address("0x55d398326f99059fF775485246999027B3197955")
         self.BUSD = Web3.to_checksum_address("0xe9e7cea3dedca5984780Bafc599bD69aDd087D56")
-        self.SLIPPAGE = 0.002
+        self.SLIPPAGE_BPS = 20  # 0.2% slippage
         self.AMOUNT_USDT = 95 * 10**18
         self.MIN_PROFIT = 0.3 * 10**18
 
@@ -40,6 +40,7 @@ class EnhancedArbitrageBot:
         self.executor = ThreadPoolExecutor(max_workers=8)
         self.gas_strategy = "medium"
         self.bnb_price = None
+        self.gas_price = None
 
         self.ERC20_ABI = [
             {
@@ -68,16 +69,21 @@ class EnhancedArbitrageBot:
         params = {
             "sellToken": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
             "buyToken": self.USDT,
-            "sellAmount": str(10**18)
+            "sellAmount": str(10**18),
+            "chainId": 56,
+            "taker": self.address
         }
         headers = {
-            "0x-api-key": self.zerox_api_key
+            "0x-api-key": self.zerox_api_key,
+            "0x-version": "v2"
         }
         try:
-            async with self.session.get(url, params=params, headers=headers, timeout=2) as resp:
+            async with self.session.get(url, params=params, headers=headers, timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     return int(float(data['price']) * 1e18)
+                elif resp.status == 403:
+                    print(f"0x price API error (403): {await resp.text()}")
                 else:
                     print(f"0x price API error: {resp.status} - {await resp.text()}")
         except Exception as e:
@@ -126,18 +132,21 @@ class EnhancedArbitrageBot:
             "sellToken": sell_token,
             "buyToken": buy_token,
             "sellAmount": str(sell_amount),
-            "slippagePercentage": self.SLIPPAGE,
-            "takerAddress": self.address,
-            "affiliateAddress": "0x0000000000000000000000000000000000000000",
-            "gasPrice": str(self.gas_price)
+            "chainId": 56,
+            "taker": self.address,
+            "gasPrice": str(self.gas_price),
+            "slippageBps": self.SLIPPAGE_BPS
         }
         headers = {
-            "0x-api-key": self.zerox_api_key
+            "0x-api-key": self.zerox_api_key,
+            "0x-version": "v2"
         }
         try:
-            async with self.session.get(url, params=params, headers=headers, timeout=5) as resp:
+            async with self.session.get(url, params=params, headers=headers, timeout=10) as resp:
                 if resp.status == 200:
                     return await resp.json()
+                elif resp.status == 403:
+                    print(f"0x API error (403): {await resp.text()}")
                 else:
                     error_text = await resp.text()
                     print(f"0x API error ({resp.status}): {error_text}")
