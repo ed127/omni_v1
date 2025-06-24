@@ -26,8 +26,10 @@ class EnhancedArbitrageBot:
         self.telegram_token = os.getenv("TELEGRAM_TOKEN")
         self.chat_id = os.getenv("TELEGRAM_CHAT_ID")
         
-        self.USDT = "0x55d398326f99059fF775485246999027B3197955"
-        self.BUSD = "0xe9e7cea3dedca5984780bafc599bd69add087d56"
+        
+        self.USDT = Web3.to_checksum_address("0x55d398326f99059fF775485246999027B3197955")
+        self.BUSD = Web3.to_checksum_address("0xe9e7cea3dedca5984780bafc599bd69add087d56")
+
         self.SLIPPAGE = 0.002
         self.AMOUNT_USDT = 95 * 10**18 # Initial amount for checking arbitrage
         self.MIN_PROFIT = 0.3 * 10**18 # Minimum profit in Wei (0.3 USDT)
