@@ -6,6 +6,8 @@ from web3.exceptions import TransactionNotFound
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
 import time
+from flask import Flask, jsonify
+import threading
 
 load_dotenv()
 
@@ -309,22 +311,60 @@ class EnhancedArbitrageBot:
             return False
 
     async def run(self):
-        # Properly indented async main loop for the bot
+        await self._send_telegram("🚀 <b>Enhanced Arbitrage Bot Started!</b>")
         async with aiohttp.ClientSession() as session:
             self.session = session
-            await self._send_telegram("🚀 <b>Enhanced Arbitrage Bot Started!</b>")
-            try:
-                while True:
+            self.bnb_price = await self._get_bnb_price() or 300 * 10**18
+            await self._update_gas_parameters()
+            while True:
+                try:
+                    if time.time() % 600 < 5:
+                         await self._update_gas_parameters()
                     quote1, quote2, net_profit_wei, direction, profit_percent = await self._check_arbitrage()
-                    if net_profit_wei and net_profit_wei > self.MIN_PROFIT:
-                        net_profit_usd = net_profit_wei / 1e18  # assuming profit is in USDT wei
-                        print(f"Arbitrage Found: {direction} | Est. Net Profit: {net_profit_usd:.6f} USDT ({profit_percent:.4f}%)")
-                        await self._execute_arbitrage(quote1, quote2, direction, net_profit_usd, profit_percent)
+                    if net_profit_wei > 0:
+                        net_profit_usd = net_profit_wei / 1e18
+                        if net_profit_wei > self.MIN_PROFIT:
+                            print(f"Arbitrage Found: {direction} | Est. Net Profit: {net_profit_usd:.6f} USDT ({profit_percent:.4f}%) - Executing...")
+                            if await self._execute_arbitrage(quote1, quote2, direction, net_profit_usd, profit_percent):
+                                await asyncio.sleep(60)
+                        else:
+                            telegram_message = (
+                                f"<b>📉 Arbitrage Found (Low Profit)</b>\n"
+                                f"<b>Direction:</b> {direction}\n"
+                                f"<b>Est. Net Profit:</b> {net_profit_usd:.6f} USDT\n"
+                                f"<b>Profitability:</b> {profit_percent:.4f}%\n"
+                                f"<b>Status:</b> Not executed (below <code>MIN_PROFIT</code> of {self.MIN_PROFIT / 1e18:.6f} USDT)"
+                            )
+                            await self._send_telegram(telegram_message)
+                            print(f"Arbitrage Found: {direction} | Est. Net Profit: {net_profit_usd:.6f} USDT ({profit_percent:.4f}%)")
                     await asyncio.sleep(10)
-            except Exception as e:
-                print(f"Main loop error: {e}")
-                await asyncio.sleep(30)
+                except Exception as e:
+                    print(f"Main loop error: {e}")
+                    await asyncio.sleep(30)
+
+# --- Flask Web Server Setup ---
+app = Flask(__name__)
+bot_instance = EnhancedArbitrageBot()
+
+@app.route("/")
+def home():
+    return "Arbitrage Bot is running!"
+
+@app.route("/status")
+def status():
+    return jsonify({
+        "address": bot_instance.address,
+        "bnb_price": str(bot_instance.bnb_price) if bot_instance.bnb_price else None,
+        "gas_strategy": bot_instance.gas_strategy,
+        "min_profit": str(bot_instance.MIN_PROFIT),
+        "running": True
+    })
+
+def start_bot():
+    asyncio.run(bot_instance.run())
 
 if __name__ == "__main__":
-    bot = EnhancedArbitrageBot()
-    asyncio.run(bot.run())
+    # Start the bot in a separate thread
+    threading.Thread(target=start_bot, daemon=True).start()
+    # Start Flask web server
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
