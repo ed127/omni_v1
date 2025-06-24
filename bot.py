@@ -28,8 +28,6 @@ class EnhancedArbitrageBot:
         if not self.zerox_api_key:
             raise ValueError("ZEROX_API_KEY environment variable not set.")
 
-
-        # Use checksum addresses
         self.USDT = Web3.to_checksum_address("0x55d398326f99059fF775485246999027B3197955")
         self.BUSD = Web3.to_checksum_address("0xe9e7cea3dedca5984780Bafc599bD69aDd087D56")
         self.SLIPPAGE = 0.002
@@ -78,9 +76,11 @@ class EnhancedArbitrageBot:
                 if resp.status == 200:
                     data = await resp.json()
                     return int(float(data['price']) * 1e18)
+                else:
+                    print(f"0x price API error: {resp.status} - {await resp.text()}")
         except Exception as e:
             print(f"Error getting BNB price: {e}")
-            return None
+        return None
 
     async def _update_gas_parameters(self):
         try:
@@ -201,6 +201,7 @@ class EnhancedArbitrageBot:
         busd_usdt_task = self._get_quote(self.BUSD, self.USDT, self.AMOUNT_USDT)
         quote1, quote2 = await asyncio.gather(usdt_busd_task, busd_usdt_task)
         opportunities = []
+
         # Path: USDT -> BUSD -> USDT
         if quote1 and quote2:
             amount_out_usdt_to_busd = int(quote1['buyAmount'])
@@ -224,6 +225,7 @@ class EnhancedArbitrageBot:
                     "gross_profit_wei": gross_profit_usdt_wei,
                     "profit_percent": profit_percent
                 })
+
         # Path: BUSD -> USDT -> BUSD
         current_busd_balance = self._get_token_balance(self.BUSD)
         if quote2 and current_busd_balance >= self.AMOUNT_USDT:
@@ -307,39 +309,15 @@ class EnhancedArbitrageBot:
             return False
 
     async def run(self):
-        await self._send_telegram("🚀 <b>Enhanced Arbitrage Bot Started!</b>")
-        async with aiohttp.ClientSession() as session:
-            self.session = session
-            self.bnb_price = await self._get_bnb_price() or 300 * 10**18
-            await self._update_gas_parameters()
-            while True:
-                try:
-                    if time.time() % 600 < 5:
-                         await self._update_gas_parameters()
-                    quote1, quote2, net_profit_wei, direction, profit_percent = await self._check_arbitrage()
-                    if net_profit_wei > 0:
-                        net_profit_usd = net_profit_wei / 1e18
-                        if net_profit_wei > self.MIN_PROFIT:
-                            print(f"Arbitrage Found: {direction} | Est. Net Profit: {net_profit_usd:.6f} USDT ({profit_percent:.4f}%) - Executing...")
-                            if await self._execute_arbitrage(quote1, quote2, direction, net_profit_usd, profit_percent):
-                                await asyncio.sleep(60)
-                        else:
-                            telegram_message = (
-                                f"<b>📉 Arbitrage Found (Low Profit)</b>\n"
-                                f"<b>Direction:</b> {direction}\n"
-                                f"<b>Est. Net Profit:</b> {net_profit_usd:.6f} USDT\n"
-                                f"<b>Profitability:</b> {profit_percent:.4f}%\n"
-                                f"<b>Status:</b> Not executed (below <code>MIN_PROFIT</code> of {self.MIN_PROFIT / 1e18:.6f} USDT)"
-                            )
-                            await self._send_telegram(telegram_message)
-                            print(f"Arbitrage Found: {direction} | Est. Net Profit: {net_profit_usd:.6f} USDT ({profit_percent:.4f}%) - Too low, skipping.")
-                    await asyncio.sleep(5)
-                except Exception as e:
-                    print(f"Main bot loop error: {e}")
-                    await self._send_telegram(f"⚠️ <b>Bot Main Loop Error!</b>\nError: {str(e)}")
-                    await asyncio.sleep(30)
+    await self._send_telegram("🚀 <b>Enhanced Arbitrage Bot Started!</b>")
+    try:
+        print(f"Arbitrage Found: {direction} | Est. Net Profit: {net_profit_usd:.6f} USDT ({profit_percent:.4f}%)")
+        await asyncio.sleep(10)
+    except Exception as e:
+        print(f"Main loop error: {e}")
+        await asyncio.sleep(30)
 
-# To run the bot (example for use in Flask background thread or standalone script):
-# if __name__ == "__main__":
-#     bot = EnhancedArbitrageBot()
-#     asyncio.run(bot.run())
+if __name__ == "__main__":
+    bot = EnhancedArbitrageBot()
+    asyncio.run(bot.run())
+
