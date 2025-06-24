@@ -309,15 +309,22 @@ class EnhancedArbitrageBot:
             return False
 
     async def run(self):
-    await self._send_telegram("🚀 <b>Enhanced Arbitrage Bot Started!</b>")
-    try:
-        print(f"Arbitrage Found: {direction} | Est. Net Profit: {net_profit_usd:.6f} USDT ({profit_percent:.4f}%)")
-        await asyncio.sleep(10)
-    except Exception as e:
-        print(f"Main loop error: {e}")
-        await asyncio.sleep(30)
+        # Properly indented async main loop for the bot
+        async with aiohttp.ClientSession() as session:
+            self.session = session
+            await self._send_telegram("🚀 <b>Enhanced Arbitrage Bot Started!</b>")
+            try:
+                while True:
+                    quote1, quote2, net_profit_wei, direction, profit_percent = await self._check_arbitrage()
+                    if net_profit_wei and net_profit_wei > self.MIN_PROFIT:
+                        net_profit_usd = net_profit_wei / 1e18  # assuming profit is in USDT wei
+                        print(f"Arbitrage Found: {direction} | Est. Net Profit: {net_profit_usd:.6f} USDT ({profit_percent:.4f}%)")
+                        await self._execute_arbitrage(quote1, quote2, direction, net_profit_usd, profit_percent)
+                    await asyncio.sleep(10)
+            except Exception as e:
+                print(f"Main loop error: {e}")
+                await asyncio.sleep(30)
 
 if __name__ == "__main__":
     bot = EnhancedArbitrageBot()
     asyncio.run(bot.run())
-
