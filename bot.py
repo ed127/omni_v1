@@ -1,335 +1,149 @@
 import os
-import asyncio
-import aiohttp
-from web3 import Web3
-from web3.exceptions import TransactionNotFound
-from dotenv import load_dotenv
-from concurrent.futures import ThreadPoolExecutor
 import time
-import logging
+from threading import Thread
+from flask import Flask
+from dotenv import load_dotenv
+from web3 import Web3
+from web3.middleware import geth_poa_middleware
 
 load_dotenv()
 
-class EnhancedArbitrageBot:
+# PancakeSwap v2 Router
+PANCAKE_ROUTER = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
+USDT = Web3.to_checksum_address("0x55d398326f99059fF775485246999027B3197955")
+BUSD = Web3.to_checksum_address("0xe9e7cea3dedca5984780Bafc599bD69aDd087D56")
+
+ROUTER_ABI = [
+    {"inputs":[{"internalType":"uint256","name":"amountIn","type":"uint256"},{"internalType":"address[]","name":"path","type":"address[]"}],"name":"getAmountsOut","outputs":[{"internalType":"uint256[]","name":"","type":"uint256[]"}],"stateMutability":"view","type":"function"},
+]
+
+# Load your deployed flash loan contract ABI and address from environment or file
+FLASHLOAN_CONTRACT_ADDRESS = Web3.to_checksum_address(os.getenv("FLASHLOAN_CONTRACT_ADDRESS"))
+with open("FlashLoanArb.abi") as f:
+    FLASHLOAN_CONTRACT_ABI = f.read()
+
+class FlashLoanArbBot:
     def __init__(self):
-        self.BSC_RPCS = [
-            "https://bsc-dataseed.binance.org/",
-            "https://bsc-dataseed1.defibit.io/",
-            "https://bsc-dataseed1.ninicoin.io/"
-        ]
-        self.web3 = self._setup_web3()
+        self.BSC_RPC = os.getenv("BSC_RPC", "https://bsc-dataseed.binance.org/")
+        self.web3 = Web3(Web3.HTTPProvider(self.BSC_RPC))
+        self.web3.middleware_onion.inject(geth_poa_middleware, layer=0)
         self.private_key = os.getenv("PRIVATE_KEY")
         if not self.private_key:
             raise ValueError("PRIVATE_KEY environment variable not set.")
         self.account = self.web3.eth.account.from_key(self.private_key)
         self.address = self.account.address
-        self.telegram_token = os.getenv("TELEGRAM_TOKEN")
-        self.chat_id = os.getenv("TELEGRAM_CHAT_ID")
-        self.zerox_api_key = os.getenv("ZEROX_API_KEY")
-        if not self.zerox_api_key:
-            raise ValueError("ZEROX_API_KEY environment variable not set.")
 
-        self.USDT = Web3.to_checksum_address("0x55d398326f99059fF775485246999027B3197955")
-        self.BUSD = Web3.to_checksum_address("0xe9e7cea3dedca5984780Bafc599bD69aDd087D56")
-        self.SLIPPAGE_BPS = 20  # 0.2% slippage
-        self.AMOUNT_USDT = 95 * 10**18
-        self.MIN_PROFIT = 0.3 * 10**18
-        self.EXCLUDED_SOURCES = "PancakeSwap,MDEX"  # Unreliable sources
-        self.AFFILIATE_ADDRESS = os.getenv("AFFILIATE_ADDRESS", "")
+        self.router = self.web3.eth.contract(address=PANCAKE_ROUTER, abi=ROUTER_ABI)
+        self.flashloan_contract = self.web3.eth.contract(
+            address=FLASHLOAN_CONTRACT_ADDRESS,
+            abi=FLASHLOAN_CONTRACT_ABI
+        )
 
-        self.session = None
-        self.executor = ThreadPoolExecutor(max_workers=8)
-        self.gas_strategy = "medium"
-        self.bnb_price = None
-        self.gas_price = None
+        # User settings
+        self.min_loan = int(100 * 10**18)   # Try with 100 USDT (change as needed)
+        self.max_loan = int(5000 * 10**18)  # Max 5000 USDT (change as needed)
+        self.loan_step = int(100 * 10**18)  # Step size for loan search
+        self.flashloan_fee = 0.0009         # 0.09% for DODO
+        self.gas_limit = 600000             # Estimate for flash loan arb
+        self.slippage = 0.002               # 0.2% slippage
 
-        self.ERC20_ABI = [
-            {
-                "constant": True,
-                "inputs": [{"name": "_owner", "type": "address"}],
-                "name": "balanceOf",
-                "outputs": [{"name": "balance", "type": "uint256"}],
-                "type": "function"
-            }
-        ]
-
-    def _setup_web3(self):
-        for rpc in self.BSC_RPCS:
-            try:
-                w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 5}))
-                if w3.is_connected():
-                    print(f"Connected to BSC RPC: {rpc}")
-                    return w3
-            except Exception as e:
-                print(f"Could not connect to {rpc}: {e}")
-                continue
-        raise Exception("No RPC connection available")
-
-    async def _get_bnb_price(self):
-        url = "https://bsc.api.0x.org/swap/v1/price"
-        params = {
-            "sellToken": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-            "buyToken": self.USDT,
-            "sellAmount": str(10**18),
-            "chainId": 56,
-            "taker": self.address,
-            "excludedSources": self.EXCLUDED_SOURCES,
-            "intentOnFilling": "true"
-        }
-        headers = {"0x-api-key": self.zerox_api_key}
+    def get_amount_out(self, amount_in, path):
         try:
-            async with self.session.get(url, params=params, headers=headers, timeout=8) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return int(float(data['price']) * 1e18)
-                elif resp.status == 429:
-                    print("Rate limited - retrying after delay")
-                    await asyncio.sleep(2)
-                    return await self._get_bnb_price()
-                else:
-                    print(f"0x price API error: {resp.status} - {await resp.text()}")
-                    return None
+            amounts = self.router.functions.getAmountsOut(amount_in, path).call()
+            return amounts[-1]
+        except Exception as e:
+            print(f"Error getting amount out: {e}")
+            return 0
+
+    def get_bnb_usdt_price(self):
+        # Get BNB price in USDT using PancakeSwap
+        try:
+            wbnb = Web3.to_checksum_address("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c")
+            amounts = self.router.functions.getAmountsOut(10**18, [wbnb, USDT]).call()
+            return amounts[-1] / 1e18
         except Exception as e:
             print(f"Error getting BNB price: {e}")
-            return None
+            return 600  # fallback
 
-    async def _update_gas_parameters(self):
-        try:
-            self.bnb_price = await self._get_bnb_price() or self.bnb_price or 300 * 10**18
-            current_gas = self.web3.eth.gas_price
+    def estimate_gas_cost_usdt(self):
+        gas_price = self.web3.eth.gas_price
+        bnb_usdt = self.get_bnb_usdt_price()
+        return self.gas_limit * gas_price / 1e18 * bnb_usdt
+
+    def expected_profit(self, loan_amount, direction):
+        # direction: True = USDT->BUSD->USDT, False = BUSD->USDT->BUSD
+        if direction:
+            out1 = self.get_amount_out(loan_amount, [USDT, BUSD])
+            out2 = self.get_amount_out(out1, [BUSD, USDT])
+        else:
+            out1 = self.get_amount_out(loan_amount, [BUSD, USDT])
+            out2 = self.get_amount_out(out1, [USDT, BUSD])
+        flash_fee = loan_amount * self.flashloan_fee
+        gas_cost = self.estimate_gas_cost_usdt()
+        profit = out2 - loan_amount - flash_fee - gas_cost
+        print(f"Loan: {loan_amount/1e18:.2f}, Dir: {'USDT→BUSD→USDT' if direction else 'BUSD→USDT→BUSD'}, "
+              f"Profit: {profit/1e18:.6f} USDT, Gas: {gas_cost:.4f} USDT, Fee: {flash_fee/1e18:.6f} USDT")
+        return profit
+
+    def find_best_opportunity(self):
+        best_profit = 0
+        best_amount = 0
+        best_direction = True
+        for direction in [True, False]:
+            for loan in range(self.min_loan, self.max_loan + self.loan_step, self.loan_step):
+                profit = self.expected_profit(loan, direction)
+                if profit > best_profit:
+                    best_profit = profit
+                    best_amount = loan
+                    best_direction = direction
+        return best_profit, best_amount, best_direction
+
+    def execute_flashloan(self, loan_amount, direction):
+        print(f"Executing flash loan: {loan_amount/1e18:.2f} USDT, Direction: {'USDT→BUSD→USDT' if direction else 'BUSD→USDT→BUSD'}")
+        nonce = self.web3.eth.get_transaction_count(self.address)
+        tx = self.flashloan_contract.functions.executeArbitrage(
+            loan_amount, direction
+        ).build_transaction({
+            'from': self.address,
+            'nonce': nonce,
+            'gas': self.gas_limit,
+            'gasPrice': self.web3.eth.gas_price,
+        })
+        signed = self.web3.eth.account.sign_transaction(tx, self.private_key)
+        tx_hash = self.web3.eth.send_raw_transaction(signed.rawTransaction)
+        print(f"Flash loan TX: {self.web3.to_hex(tx_hash)}")
+        receipt = self.web3.eth.wait_for_transaction_receipt(tx_hash)
+        print("Transaction receipt:", receipt)
+        return receipt.status == 1
+
+    def run(self):
+        print("Flash Loan Arbitrage Bot started.")
+        while True:
             try:
-                block = self.web3.eth.get_block('latest')
-                base_fee = block.baseFeePerGas if 'baseFeePerGas' in block else current_gas
-            except Exception as e:
-                print(f"Could not get baseFeePerGas: {e}")
-                base_fee = current_gas
-
-            self.gas_price = min(int(current_gas * 1.15), int(base_fee * 1.5), 10 * 10**9)
-            print(f"Gas Price: {self.gas_price / 1e9:.2f} Gwei")
-        except Exception as e:
-            print(f"Error updating gas: {e}")
-            self.gas_price = self.web3.eth.gas_price
-
-    async def _send_telegram(self, message):
-        if not self.session or not self.telegram_token or not self.chat_id:
-            print("Telegram not configured")
-            return
-        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-        data = {"chat_id": self.chat_id, "text": message, "parse_mode": "HTML"}
-        try:
-            async with self.session.post(url, data=data, timeout=5) as resp:
-                if resp.status != 200:
-                    print(f"Telegram error: {await resp.text()}")
-        except Exception as e:
-            print(f"Telegram send error: {e}")
-
-    async def _get_quote(self, sell_token, buy_token, sell_amount, retry=0):
-        if not self.session:
-            return None
-        url = "https://bsc.api.0x.org/swap/v1/quote"
-        params = {
-            "sellToken": sell_token,
-            "buyToken": buy_token,
-            "sellAmount": str(sell_amount),
-            "chainId": 56,
-            "taker": self.address,
-            "gasPrice": str(self.gas_price),
-            "slippageBps": self.SLIPPAGE_BPS,
-            "excludedSources": self.EXCLUDED_SOURCES,
-            "intentOnFilling": "true",
-            "affiliateAddress": self.AFFILIATE_ADDRESS
-        }
-        headers = {
-            "0x-api-key": self.zerox_api_key,
-            "0x-api-version": "1.0.0"
-        }
-        try:
-            async with self.session.get(url, params=params, headers=headers, timeout=10) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                elif resp.status == 429 and retry < 3:
-                    print(f"Rate limited (retry {retry+1}/3)")
-                    await asyncio.sleep(1.5 * (retry+1))
-                    return await self._get_quote(sell_token, buy_token, sell_amount, retry+1)
-                elif resp.status == 403:
-                    print(f"API key error: {await resp.text()}")
+                profit, amount, direction = self.find_best_opportunity()
+                if profit > 0:
+                    print(f"Profitable opportunity found! Profit: {profit/1e18:.6f} USDT (loan: {amount/1e18:.2f})")
+                    self.execute_flashloan(amount, direction)
+                    time.sleep(60)  # Wait after a trade
                 else:
-                    print(f"Quote error ({resp.status}): {await resp.text()}")
-        except Exception as e:
-            print(f"Quote exception: {e}")
-        return None
-
-    def _get_token_balance(self, token_address):
-        contract = self.web3.eth.contract(
-            address=token_address,
-            abi=self.ERC20_ABI
-        )
-        return contract.functions.balanceOf(self.address).call()
-
-    def _execute_swap(self, quote):
-        try:
-            txn = {
-                'from': quote['from'],
-                'to': quote['to'],
-                'data': quote['data'],
-                'value': int(quote['value']),
-                'gas': min(int(quote['gas']) * 13 // 10, 800000),
-                'gasPrice': self.gas_price,
-                'nonce': self.web3.eth.get_transaction_count(self.address),
-            }
-            signed = self.web3.eth.account.sign_transaction(txn, self.private_key)
-            tx_hash = self.web3.eth.send_raw_transaction(signed.rawTransaction)
-            return self.web3.to_hex(tx_hash)
-        except Exception as e:
-            print(f"Swap execution failed: {e}")
-            raise
-
-    async def _wait_for_confirmation(self, tx_hash, timeout=45):
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            try:
-                receipt = self.web3.eth.get_transaction_receipt(tx_hash)
-                if receipt:
-                    return receipt.status == 1
-                await asyncio.sleep(1.5)
-            except TransactionNotFound:
-                await asyncio.sleep(2)
+                    print("No profitable opportunity. Waiting...")
+                    time.sleep(5)
             except Exception as e:
-                print(f"Confirmation error: {e}")
-                await asyncio.sleep(2)
-        print(f"Confirmation timeout: {tx_hash}")
-        return False
+                print(f"Error in main loop: {e}")
+                time.sleep(10)
 
-    async def _calculate_net_profit(self, profit_wei, tx1_gas_used, tx2_gas_used):
-        if not self.bnb_price:
-            self.bnb_price = await self._get_bnb_price() or 300 * 10**18
-        total_gas_wei = (tx1_gas_used + tx2_gas_used) * self.gas_price
-        gas_cost_usdt_wei = (total_gas_wei * self.bnb_price) // (10**18)
-        return profit_wei - gas_cost_usdt_wei
+# Flask app for Render port binding
+app = Flask(__name__)
 
-    async def _check_arbitrage(self):
-        print("\nChecking arbitrage...")
-        usdt_busd_task = self._get_quote(self.USDT, self.BUSD, self.AMOUNT_USDT)
-        busd_usdt_task = self._get_quote(self.BUSD, self.USDT, self.AMOUNT_USDT)
-        quote1, quote2 = await asyncio.gather(usdt_busd_task, busd_usdt_task)
-        opportunities = []
+@app.route('/')
+def index():
+    return "Flash loan arbitrage bot is running."
 
-        # USDT → BUSD → USDT path
-        if quote1 and quote2:
-            amount_out = int(quote1['buyAmount'])
-            final_quote = await self._get_quote(self.BUSD, self.USDT, amount_out)
-            if final_quote:
-                final_amount = int(final_quote['buyAmount'])
-                gross_profit = final_amount - self.AMOUNT_USDT
-                net_profit = await self._calculate_net_profit(
-                    gross_profit,
-                    int(quote1['gas']),
-                    int(final_quote['gas'])
-                )
-                profit_pct = (net_profit / self.AMOUNT_USDT) * 100
-                opportunities.append({
-                    "path": "USDT→BUSD→USDT",
-                    "quote1": quote1,
-                    "quote2": final_quote,
-                    "net_profit": net_profit,
-                    "profit_pct": profit_pct
-                })
-
-        # BUSD → USDT → BUSD path
-        busd_balance = self._get_token_balance(self.BUSD)
-        if quote2 and busd_balance >= self.AMOUNT_USDT:
-            amount_out = int(quote2['buyAmount'])
-            final_quote = await self._get_quote(self.USDT, self.BUSD, amount_out)
-            if final_quote:
-                final_amount = int(final_quote['buyAmount'])
-                gross_profit = final_amount - self.AMOUNT_USDT
-                net_profit = await self._calculate_net_profit(
-                    gross_profit,
-                    int(quote2['gas']),
-                    int(final_quote['gas'])
-                )
-                profit_pct = (net_profit / self.AMOUNT_USDT) * 100
-                opportunities.append({
-                    "path": "BUSD→USDT→BUSD",
-                    "quote1": quote2,
-                    "quote2": final_quote,
-                    "net_profit": net_profit,
-                    "profit_pct": profit_pct
-                })
-
-        if not opportunities:
-            print("No arbitrage found")
-            return None, None, 0, None, 0
-
-        best = max(opportunities, key=lambda x: x["net_profit"])
-        return (
-            best["quote1"],
-            best["quote2"],
-            best["net_profit"],
-            best["path"],
-            best["profit_pct"]
-        )
-
-    async def _execute_arbitrage(self, quote1, quote2, path, net_profit, profit_pct):
-        try:
-            await self._update_gas_parameters()
-            await self._send_telegram(
-                f"<b>🚀 Arbitrage Found</b>\n"
-                f"Path: {path}\n"
-                f"Profit: {net_profit/1e18:.6f} USDT\n"
-                f"ROI: {profit_pct:.4f}%\n"
-                f"Executing..."
-            )
-
-            tx1_hash = await asyncio.get_event_loop().run_in_executor(
-                self.executor, self._execute_swap, quote1
-            )
-            if not await self._wait_for_confirmation(tx1_hash):
-                await self._send_telegram("⚠️ TX1 failed")
-                return False
-
-            tx2_hash = await asyncio.get_event_loop().run_in_executor(
-                self.executor, self._execute_swap, quote2
-            )
-            if not await self._wait_for_confirmation(tx2_hash):
-                await self._send_telegram("⚠️ TX2 failed")
-                return False
-
-            await self._send_telegram(
-                f"<b>✅ Arbitrage Complete</b>\n"
-                f"Path: {path}\n"
-                f"Net Profit: {net_profit/1e18:.6f} USDT\n"
-                f"<a href='https://bscscan.com/tx/{tx1_hash}'>TX1</a> | "
-                f"<a href='https://bscscan.com/tx/{tx2_hash}'>TX2</a>"
-            )
-            return True
-        except Exception as e:
-            await self._send_telegram(f"❌ Execution failed: {str(e)}")
-            print(f"Arbitrage error: {e}")
-            return False
-
-    async def run(self):
-        await self._send_telegram("🤖 Arbitrage Bot Started")
-        async with aiohttp.ClientSession() as session:
-            self.session = session
-            self.bnb_price = await self._get_bnb_price() or 300 * 10**18
-            while True:
-                try:
-                    # Update gas every 10 minutes
-                    if int(time.time()) % 600 < 5:
-                        await self._update_gas_parameters()
-
-                    q1, q2, profit, path, pct = await self._check_arbitrage()
-                    if profit > self.MIN_PROFIT:
-                        print(f"Executing {path} (Profit: {profit/1e18:.6f} USDT)")
-                        if await self._execute_arbitrage(q1, q2, path, profit, pct):
-                            await asyncio.sleep(60)
-                    else:
-                        await asyncio.sleep(5)
-                except Exception as e:
-                    print(f"Main loop error: {e}")
-                    await asyncio.sleep(10)
+def start_bot():
+    bot = FlashLoanArbBot()
+    bot.run()
 
 if __name__ == "__main__":
-    bot = EnhancedArbitrageBot()
-    asyncio.run(bot.run())
+    Thread(target=start_bot, daemon=True).start()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
