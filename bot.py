@@ -6,8 +6,7 @@ from web3.exceptions import TransactionNotFound
 from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor
 import time
-from flask import Flask, jsonify
-import threading
+import logging
 
 load_dotenv()
 
@@ -35,6 +34,8 @@ class EnhancedArbitrageBot:
         self.SLIPPAGE_BPS = 20  # 0.2% slippage
         self.AMOUNT_USDT = 95 * 10**18
         self.MIN_PROFIT = 0.3 * 10**18
+        self.EXCLUDED_SOURCES = "PancakeSwap,MDEX"  # Unreliable sources
+        self.AFFILIATE_ADDRESS = os.getenv("AFFILIATE_ADDRESS", "")
 
         self.session = None
         self.executor = ThreadPoolExecutor(max_workers=8)
@@ -71,24 +72,26 @@ class EnhancedArbitrageBot:
             "buyToken": self.USDT,
             "sellAmount": str(10**18),
             "chainId": 56,
-            "taker": self.address
+            "taker": self.address,
+            "excludedSources": self.EXCLUDED_SOURCES,
+            "intentOnFilling": "true"
         }
-        headers = {
-            "0x-api-key": self.zerox_api_key,
-            "0x-version": "v2"
-        }
+        headers = {"0x-api-key": self.zerox_api_key}
         try:
-            async with self.session.get(url, params=params, headers=headers, timeout=5) as resp:
+            async with self.session.get(url, params=params, headers=headers, timeout=8) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     return int(float(data['price']) * 1e18)
-                elif resp.status == 403:
-                    print(f"0x price API error (403): {await resp.text()}")
+                elif resp.status == 429:
+                    print("Rate limited - retrying after delay")
+                    await asyncio.sleep(2)
+                    return await self._get_bnb_price()
                 else:
                     print(f"0x price API error: {resp.status} - {await resp.text()}")
+                    return None
         except Exception as e:
             print(f"Error getting BNB price: {e}")
-        return None
+            return None
 
     async def _update_gas_parameters(self):
         try:
@@ -98,33 +101,29 @@ class EnhancedArbitrageBot:
                 block = self.web3.eth.get_block('latest')
                 base_fee = block.baseFeePerGas if 'baseFeePerGas' in block else current_gas
             except Exception as e:
-                print(f"Could not get baseFeePerGas, using current_gas: {e}")
+                print(f"Could not get baseFeePerGas: {e}")
                 base_fee = current_gas
 
-            if self.gas_strategy == "aggressive":
-                self.gas_price = min(int(current_gas * 1.3), int(base_fee * 2), 20 * 10**9)
-            else:
-                self.gas_price = min(int(current_gas * 1.15), int(base_fee * 1.5), 10 * 10**9)
-            print(f"Gas Price (Wei): {self.gas_price / 1e9:.2f} Gwei (Current: {current_gas / 1e9:.2f} Gwei)")
+            self.gas_price = min(int(current_gas * 1.15), int(base_fee * 1.5), 10 * 10**9)
+            print(f"Gas Price: {self.gas_price / 1e9:.2f} Gwei")
         except Exception as e:
-            print(f"Error updating gas parameters: {e}")
+            print(f"Error updating gas: {e}")
             self.gas_price = self.web3.eth.gas_price
 
     async def _send_telegram(self, message):
         if not self.session or not self.telegram_token or not self.chat_id:
-            print("Telegram not configured or session not active.")
+            print("Telegram not configured")
             return
         url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
         data = {"chat_id": self.chat_id, "text": message, "parse_mode": "HTML"}
         try:
             async with self.session.post(url, data=data, timeout=5) as resp:
                 if resp.status != 200:
-                    response_text = await resp.text()
-                    print(f"Telegram API error: {resp.status} - {response_text}")
+                    print(f"Telegram error: {await resp.text()}")
         except Exception as e:
-            print(f"Error sending Telegram message: {e}")
+            print(f"Telegram send error: {e}")
 
-    async def _get_quote(self, sell_token, buy_token, sell_amount):
+    async def _get_quote(self, sell_token, buy_token, sell_amount, retry=0):
         if not self.session:
             return None
         url = "https://bsc.api.0x.org/swap/v1/quote"
@@ -135,23 +134,29 @@ class EnhancedArbitrageBot:
             "chainId": 56,
             "taker": self.address,
             "gasPrice": str(self.gas_price),
-            "slippageBps": self.SLIPPAGE_BPS
+            "slippageBps": self.SLIPPAGE_BPS,
+            "excludedSources": self.EXCLUDED_SOURCES,
+            "intentOnFilling": "true",
+            "affiliateAddress": self.AFFILIATE_ADDRESS
         }
         headers = {
             "0x-api-key": self.zerox_api_key,
-            "0x-version": "v2"
+            "0x-api-version": "1.0.0"
         }
         try:
             async with self.session.get(url, params=params, headers=headers, timeout=10) as resp:
                 if resp.status == 200:
                     return await resp.json()
+                elif resp.status == 429 and retry < 3:
+                    print(f"Rate limited (retry {retry+1}/3)")
+                    await asyncio.sleep(1.5 * (retry+1))
+                    return await self._get_quote(sell_token, buy_token, sell_amount, retry+1)
                 elif resp.status == 403:
-                    print(f"0x API error (403): {await resp.text()}")
+                    print(f"API key error: {await resp.text()}")
                 else:
-                    error_text = await resp.text()
-                    print(f"0x API error ({resp.status}): {error_text}")
+                    print(f"Quote error ({resp.status}): {await resp.text()}")
         except Exception as e:
-            print(f"Error getting 0x quote: {e}")
+            print(f"Quote exception: {e}")
         return None
 
     def _get_token_balance(self, token_address):
@@ -163,7 +168,6 @@ class EnhancedArbitrageBot:
 
     def _execute_swap(self, quote):
         try:
-            current_nonce = self.web3.eth.get_transaction_count(self.address)
             txn = {
                 'from': quote['from'],
                 'to': quote['to'],
@@ -171,32 +175,29 @@ class EnhancedArbitrageBot:
                 'value': int(quote['value']),
                 'gas': min(int(quote['gas']) * 13 // 10, 800000),
                 'gasPrice': self.gas_price,
-                'nonce': current_nonce,
+                'nonce': self.web3.eth.get_transaction_count(self.address),
             }
             signed = self.web3.eth.account.sign_transaction(txn, self.private_key)
             tx_hash = self.web3.eth.send_raw_transaction(signed.rawTransaction)
-            print(f"Sent transaction: {self.web3.to_hex(tx_hash)}")
             return self.web3.to_hex(tx_hash)
         except Exception as e:
-            print(f"Error executing swap: {e}")
-            raise e
+            print(f"Swap execution failed: {e}")
+            raise
 
     async def _wait_for_confirmation(self, tx_hash, timeout=45):
         start_time = time.time()
         while time.time() - start_time < timeout:
             try:
                 receipt = self.web3.eth.get_transaction_receipt(tx_hash)
-                if receipt is not None:
-                    print(f"Transaction {tx_hash} confirmed. Status: {receipt.status}")
+                if receipt:
                     return receipt.status == 1
                 await asyncio.sleep(1.5)
             except TransactionNotFound:
-                print(f"Transaction {tx_hash} not found yet...")
                 await asyncio.sleep(2)
             except Exception as e:
-                print(f"Error checking transaction receipt: {e}")
+                print(f"Confirmation error: {e}")
                 await asyncio.sleep(2)
-        print(f"Transaction {tx_hash} not confirmed within timeout.")
+        print(f"Confirmation timeout: {tx_hash}")
         return False
 
     async def _calculate_net_profit(self, profit_wei, tx1_gas_used, tx2_gas_used):
@@ -207,173 +208,128 @@ class EnhancedArbitrageBot:
         return profit_wei - gas_cost_usdt_wei
 
     async def _check_arbitrage(self):
-        print("\nChecking for arbitrage opportunities...")
+        print("\nChecking arbitrage...")
         usdt_busd_task = self._get_quote(self.USDT, self.BUSD, self.AMOUNT_USDT)
         busd_usdt_task = self._get_quote(self.BUSD, self.USDT, self.AMOUNT_USDT)
         quote1, quote2 = await asyncio.gather(usdt_busd_task, busd_usdt_task)
         opportunities = []
 
-        # Path: USDT -> BUSD -> USDT
+        # USDT → BUSD → USDT path
         if quote1 and quote2:
-            amount_out_usdt_to_busd = int(quote1['buyAmount'])
-            final_quote_busd_to_usdt = await self._get_quote(self.BUSD, self.USDT, amount_out_usdt_to_busd)
-            if final_quote_busd_to_usdt:
-                final_amount_usdt = int(final_quote_busd_to_usdt['buyAmount'])
-                gross_profit_usdt_wei = final_amount_usdt - self.AMOUNT_USDT
-                estimated_gas_tx1 = int(quote1['gas'])
-                estimated_gas_tx2 = int(final_quote_busd_to_usdt['gas'])
-                net_profit_usdt_wei = await self._calculate_net_profit(
-                    gross_profit_usdt_wei,
-                    estimated_gas_tx1,
-                    estimated_gas_tx2
+            amount_out = int(quote1['buyAmount'])
+            final_quote = await self._get_quote(self.BUSD, self.USDT, amount_out)
+            if final_quote:
+                final_amount = int(final_quote['buyAmount'])
+                gross_profit = final_amount - self.AMOUNT_USDT
+                net_profit = await self._calculate_net_profit(
+                    gross_profit,
+                    int(quote1['gas']),
+                    int(final_quote['gas'])
                 )
-                profit_percent = (net_profit_usdt_wei / self.AMOUNT_USDT) * 100 if self.AMOUNT_USDT else 0
+                profit_pct = (net_profit / self.AMOUNT_USDT) * 100
                 opportunities.append({
-                    "direction": "USDT→BUSD→USDT",
+                    "path": "USDT→BUSD→USDT",
                     "quote1": quote1,
-                    "quote2": final_quote_busd_to_usdt,
-                    "net_profit_wei": net_profit_usdt_wei,
-                    "gross_profit_wei": gross_profit_usdt_wei,
-                    "profit_percent": profit_percent
+                    "quote2": final_quote,
+                    "net_profit": net_profit,
+                    "profit_pct": profit_pct
                 })
 
-        # Path: BUSD -> USDT -> BUSD
-        current_busd_balance = self._get_token_balance(self.BUSD)
-        if quote2 and current_busd_balance >= self.AMOUNT_USDT:
-            amount_out_busd_to_usdt = int(quote2['buyAmount'])
-            final_quote_usdt_to_busd = await self._get_quote(self.USDT, self.BUSD, amount_out_busd_to_usdt)
-            if final_quote_usdt_to_busd:
-                final_amount_busd = int(final_quote_usdt_to_busd['buyAmount'])
-                gross_profit_busd_wei = final_amount_busd - self.AMOUNT_USDT
-                estimated_gas_tx1 = int(quote2['gas'])
-                estimated_gas_tx2 = int(final_quote_usdt_to_busd['gas'])
-                net_profit_busd_wei = await self._calculate_net_profit(
-                    gross_profit_busd_wei,
-                    estimated_gas_tx1,
-                    estimated_gas_tx2
+        # BUSD → USDT → BUSD path
+        busd_balance = self._get_token_balance(self.BUSD)
+        if quote2 and busd_balance >= self.AMOUNT_USDT:
+            amount_out = int(quote2['buyAmount'])
+            final_quote = await self._get_quote(self.USDT, self.BUSD, amount_out)
+            if final_quote:
+                final_amount = int(final_quote['buyAmount'])
+                gross_profit = final_amount - self.AMOUNT_USDT
+                net_profit = await self._calculate_net_profit(
+                    gross_profit,
+                    int(quote2['gas']),
+                    int(final_quote['gas'])
                 )
-                profit_percent = (net_profit_busd_wei / self.AMOUNT_USDT) * 100 if self.AMOUNT_USDT else 0
+                profit_pct = (net_profit / self.AMOUNT_USDT) * 100
                 opportunities.append({
-                    "direction": "BUSD→USDT→BUSD",
+                    "path": "BUSD→USDT→BUSD",
                     "quote1": quote2,
-                    "quote2": final_quote_usdt_to_busd,
-                    "net_profit_wei": net_profit_busd_wei,
-                    "gross_profit_wei": gross_profit_busd_wei,
-                    "profit_percent": profit_percent
+                    "quote2": final_quote,
+                    "net_profit": net_profit,
+                    "profit_pct": profit_pct
                 })
-        if not opportunities:
-            print("No arbitrage opportunities found at this time.")
-            return None, None, 0, None, 0
-        best_opp = max(opportunities, key=lambda x: x["net_profit_wei"])
-        return (best_opp["quote1"], best_opp["quote2"],
-                best_opp["net_profit_wei"], best_opp["direction"],
-                best_opp["profit_percent"])
 
-    async def _execute_arbitrage(self, quote1, quote2, direction, net_profit_usd, profit_percent):
+        if not opportunities:
+            print("No arbitrage found")
+            return None, None, 0, None, 0
+
+        best = max(opportunities, key=lambda x: x["net_profit"])
+        return (
+            best["quote1"],
+            best["quote2"],
+            best["net_profit"],
+            best["path"],
+            best["profit_pct"]
+        )
+
+    async def _execute_arbitrage(self, quote1, quote2, path, net_profit, profit_pct):
         try:
             await self._update_gas_parameters()
-            telegram_message = (
-                f"<b>🎯 Found Arbitrage!</b>\n"
-                f"<b>Direction:</b> {direction}\n"
-                f"<b>Est. Net Profit:</b> {net_profit_usd:.6f} USDT\n"
-                f"<b>Profitability:</b> {profit_percent:.4f}%\n"
-                f"Attempting execution..."
+            await self._send_telegram(
+                f"<b>🚀 Arbitrage Found</b>\n"
+                f"Path: {path}\n"
+                f"Profit: {net_profit/1e18:.6f} USDT\n"
+                f"ROI: {profit_pct:.4f}%\n"
+                f"Executing..."
             )
-            await self._send_telegram(telegram_message)
+
             tx1_hash = await asyncio.get_event_loop().run_in_executor(
                 self.executor, self._execute_swap, quote1
             )
-            if not await self._wait_for_confirmation(tx1_hash, 30):
-                await self._send_telegram(
-                    f"⚠️ <b>Arbitrage Failed (TX1)</b>\n"
-                    f"Direction: {direction}\n"
-                    f"TX1: <a href='https://bscscan.com/tx/{tx1_hash}'>{tx1_hash[:10]}...</a>\n"
-                    f"Reason: TX1 not confirmed or failed."
-                )
+            if not await self._wait_for_confirmation(tx1_hash):
+                await self._send_telegram("⚠️ TX1 failed")
                 return False
+
             tx2_hash = await asyncio.get_event_loop().run_in_executor(
                 self.executor, self._execute_swap, quote2
             )
-            if not await self._wait_for_confirmation(tx2_hash, 30):
-                await self._send_telegram(
-                    f"⚠️ <b>Arbitrage Failed (TX2)</b>\n"
-                    f"Direction: {direction}\n"
-                    f"TX1: <a href='https://bscscan.com/tx/{tx1_hash}'>{tx1_hash[:10]}...</a>\n"
-                    f"TX2: <a href='https://bscscan.com/tx/{tx2_hash}'>{tx2_hash[:10]}...</a>\n"
-                    f"Reason: TX2 not confirmed or failed."
-                )
+            if not await self._wait_for_confirmation(tx2_hash):
+                await self._send_telegram("⚠️ TX2 failed")
                 return False
-            tx1_link = f"https://bscscan.com/tx/{tx1_hash}"
-            tx2_link = f"https://bscscan.com/tx/{tx2_hash}"
+
             await self._send_telegram(
-                f"✅ <b>Arbitrage Completed!</b>\n"
-                f"<b>Direction:</b> {direction}\n"
-                f"<b>Net Profit:</b> {net_profit_usd:.6f} USDT\n"
-                f"<b>Profitability:</b> {profit_percent:.4f}%\n"
-                f"TX1: <a href='{tx1_link}'>View on BscScan</a>\n"
-                f"TX2: <a href='{tx2_link}'>View on BscScan</a>"
+                f"<b>✅ Arbitrage Complete</b>\n"
+                f"Path: {path}\n"
+                f"Net Profit: {net_profit/1e18:.6f} USDT\n"
+                f"<a href='https://bscscan.com/tx/{tx1_hash}'>TX1</a> | "
+                f"<a href='https://bscscan.com/tx/{tx2_hash}'>TX2</a>"
             )
             return True
         except Exception as e:
-            await self._send_telegram(f"❌ <b>Arbitrage Execution Error!</b>\nDirection: {direction}\nError: {str(e)}")
-            print(f"Error during arbitrage execution: {e}")
+            await self._send_telegram(f"❌ Execution failed: {str(e)}")
+            print(f"Arbitrage error: {e}")
             return False
 
     async def run(self):
-        await self._send_telegram("🚀 <b>Enhanced Arbitrage Bot Started!</b>")
+        await self._send_telegram("🤖 Arbitrage Bot Started")
         async with aiohttp.ClientSession() as session:
             self.session = session
             self.bnb_price = await self._get_bnb_price() or 300 * 10**18
-            await self._update_gas_parameters()
             while True:
                 try:
-                    if time.time() % 600 < 5:
-                         await self._update_gas_parameters()
-                    quote1, quote2, net_profit_wei, direction, profit_percent = await self._check_arbitrage()
-                    if net_profit_wei > 0:
-                        net_profit_usd = net_profit_wei / 1e18
-                        if net_profit_wei > self.MIN_PROFIT:
-                            print(f"Arbitrage Found: {direction} | Est. Net Profit: {net_profit_usd:.6f} USDT ({profit_percent:.4f}%) - Executing...")
-                            if await self._execute_arbitrage(quote1, quote2, direction, net_profit_usd, profit_percent):
-                                await asyncio.sleep(60)
-                        else:
-                            telegram_message = (
-                                f"<b>📉 Arbitrage Found (Low Profit)</b>\n"
-                                f"<b>Direction:</b> {direction}\n"
-                                f"<b>Est. Net Profit:</b> {net_profit_usd:.6f} USDT\n"
-                                f"<b>Profitability:</b> {profit_percent:.4f}%\n"
-                                f"<b>Status:</b> Not executed (below <code>MIN_PROFIT</code> of {self.MIN_PROFIT / 1e18:.6f} USDT)"
-                            )
-                            await self._send_telegram(telegram_message)
-                            print(f"Arbitrage Found: {direction} | Est. Net Profit: {net_profit_usd:.6f} USDT ({profit_percent:.4f}%)")
-                    await asyncio.sleep(10)
+                    # Update gas every 10 minutes
+                    if int(time.time()) % 600 < 5:
+                        await self._update_gas_parameters()
+
+                    q1, q2, profit, path, pct = await self._check_arbitrage()
+                    if profit > self.MIN_PROFIT:
+                        print(f"Executing {path} (Profit: {profit/1e18:.6f} USDT)")
+                        if await self._execute_arbitrage(q1, q2, path, profit, pct):
+                            await asyncio.sleep(60)
+                    else:
+                        await asyncio.sleep(5)
                 except Exception as e:
                     print(f"Main loop error: {e}")
-                    await asyncio.sleep(30)
-
-# --- Flask Web Server Setup ---
-app = Flask(__name__)
-bot_instance = EnhancedArbitrageBot()
-
-@app.route("/")
-def home():
-    return "Arbitrage Bot is running!"
-
-@app.route("/status")
-def status():
-    return jsonify({
-        "address": bot_instance.address,
-        "bnb_price": str(bot_instance.bnb_price) if bot_instance.bnb_price else None,
-        "gas_strategy": bot_instance.gas_strategy,
-        "min_profit": str(bot_instance.MIN_PROFIT),
-        "running": True
-    })
-
-def start_bot():
-    asyncio.run(bot_instance.run())
+                    await asyncio.sleep(10)
 
 if __name__ == "__main__":
-    # Start the bot in a separate thread
-    threading.Thread(target=start_bot, daemon=True).start()
-    # Start Flask web server
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    bot = EnhancedArbitrageBot()
+    asyncio.run(bot.run())
